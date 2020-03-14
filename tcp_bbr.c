@@ -121,9 +121,9 @@ struct bbr {
 #define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
 
 /* Window length of bw filter (in rounds): */
-static const int bbr_bw_rtts = CYCLE_LEN + 2;
+static const int bbr_bw_rtts = CYCLE_LEN + 4;
 /* Window length of min_rtt filter (in sec): */
-static const u32 bbr_min_rtt_win_sec = 10;
+static const u32 bbr_min_rtt_win_sec = 15;
 /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
 static const u32 bbr_probe_rtt_mode_ms = 200;
 /* Skip TSO below the following bandwidth (bits/sec): */
@@ -138,14 +138,14 @@ static const int bbr_high_gain  = BBR_UNIT * 2885 / 1000 + 1;
 /* The pacing gain of 1/high_gain in BBR_DRAIN is calculated to typically drain
  * the queue created in BBR_STARTUP in a single round:
  */
-static const int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
+static const int bbr_drain_gain = BBR_UNIT * 1200 / 2885;
 /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
 static const int bbr_cwnd_gain  = BBR_UNIT * 2;
 /* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
 static const int bbr_pacing_gain[] = {
-	BBR_UNIT * 5 / 4,	/* probe for more available bw */
+	BBR_UNIT * 11 / 8,	/* probe for more available bw */
 	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
-	BBR_UNIT, BBR_UNIT, BBR_UNIT,	/* cruise at 1.0*bw to utilize pipe, */
+	BBR_UNIT * 9 / 8, BBR_UNIT, BBR_UNIT * 10 / 9,	/* cruise at 1.0*bw to utilize pipe, */
 	BBR_UNIT, BBR_UNIT, BBR_UNIT	/* without creating excess queue... */
 };
 /* Randomize the starting gain cycling phase over N phases: */
@@ -310,6 +310,42 @@ static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 	}
 }
 
+
+//ADD: bbr_v2
+/* Calculate bdp based on min RTT and the estimated bottleneck bandwidth:
+ *
+ * bdp = ceil(bw * min_rtt * gain)
+ *
+ * The key factor, gain, controls the amount of queue. While a small gain
+ * builds a smaller queue, it becomes more vulnerable to noise in RTT
+ * measurements (e.g., delayed ACKs or other ACK compression effects). This
+ * noise may cause BBR to under-estimate the rate.
+ */
+static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+	u32 bdp;
+	u64 w;
+
+	/* If we've never had a valid RTT sample, cap cwnd at the initial
+	 * default. This should only happen when the connection is not using TCP
+	 * timestamps and has retransmitted all of the SYN/SYNACK/data packets
+	 * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
+	 * case we need to slow-start up toward something safe: initial cwnd.
+	 */
+	if (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
+		return TCP_INIT_CWND;  /* be safe: cap at initial cwnd */
+
+	w = (u64)bw * bbr->min_rtt_us;
+
+	/* Apply a gain to the given value, remove the BW_SCALE shift, and
+	 * round the value up to avoid a negative feedback loop.
+	 */
+	bdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
+
+	return bdp;
+}
+
 /* Find target cwnd. Right-size the cwnd based on min RTT and the
  * estimated bottleneck bandwidth:
  *
@@ -407,6 +443,17 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	return false;
 }
 
+// ADD: bbr_v2
+/* Returns the cwnd for PROBE_RTT mode. */
+static u32 bbr_probe_rtt_cwnd(struct sock *sk)
+{
+	//probe_rtt_cwnd max is 255, targe is 50%
+
+	//return bbr->bbr_cwnd_min_target;
+	return max_t(u32, bbr_cwnd_min_target, 
+				bbr_bdp(sk, bbr_bw(sk), min_t(u32, 0xFFU, BBR_UNIT * 1 / 2) ));
+}
+
 /* Slow-start up toward target cwnd (if bw estimate is growing, or packet loss
  * has drawn us down below target), or snap down to target if we're above it.
  */
@@ -434,7 +481,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 done:
 	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);	/* apply global cap */
 	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
-		tp->snd_cwnd = min(tp->snd_cwnd, bbr_cwnd_min_target);
+		tp->snd_cwnd = min(tp->snd_cwnd, bbr_probe_rtt_cwnd(sk));
 }
 
 /* End cycle phase if it's time and/or we hit the phase's in-flight target. */
@@ -801,7 +848,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
 		/* Maintain min packets in flight for max(200 ms, 1 round). */
 		if (!bbr->probe_rtt_done_stamp &&
-		    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+		    tcp_packets_in_flight(tp) <= bbr_probe_rtt_cwnd(sk)) {
 			bbr->probe_rtt_done_stamp = tcp_jiffies32 +
 				msecs_to_jiffies(bbr_probe_rtt_mode_ms);
 			bbr->probe_rtt_round_done = 0;
@@ -939,7 +986,7 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
 
 static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 	.flags		= TCP_CONG_NON_RESTRICTED,
-	.name		= "bbr",
+	.name		= "bbr_mod",
 	.owner		= THIS_MODULE,
 	.init		= bbr_init,
 	.cong_control	= bbr_main,
