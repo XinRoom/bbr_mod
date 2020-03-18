@@ -90,12 +90,30 @@ mkdir bbr_mod && cd bbr_mod
 
 echo 'obj-m:=tcp_bbr_mod.o' >./Makefile
 make -C /lib/modules/$(uname -r)/build M=`pwd` modules
+cp -rf ./tcp_bbr_mod.ko /lib/modules/$(uname -r)/kernel/net/ipv4 && depmod -a && modprobe tcp_bbr_mod
+lsmod |grep  bbr_mod
+
+//建议reboot
+```
+
+每次小版本升级内核后都要执行：
+```bash
+#!/bin/bash
+set -eux
+set -o pipefail
+
+
+rm -rf bbr_mod
+mkdir bbr_mod && cd bbr_mod
+
+wget https://github.com/XinRoom/bbr_mod/raw/master/tcp_bbr_mod.c
+
+echo 'obj-m:=tcp_bbr_mod.o' >./Makefile
+make -C /lib/modules/$(uname -r)/build M=`pwd` modules
 cp -rf ./tcp_bbr_mod.ko /lib/modules/$(uname -r)/kernel/net/ipv4
 depmod -a
 modprobe tcp_bbr_mod
-lsmod |grep -q 'bbr'
-
-//建议reboot
+lsmod |grep 'bbr'
 ```
 
 
